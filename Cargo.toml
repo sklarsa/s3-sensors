@@ -80,3 +80,7 @@ codegen-units = 1     # LLVM can perform better optimizations using a single thr
 debug         = 2     # prefer slower builds but better debugging experience
 lto           = 'fat'
 opt-level     = 's'
+
+[features]
+# send ILP over HTTP instead of QWP over WebSocket, for comparison
+ilp = []

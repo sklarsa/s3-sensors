@@ -1,7 +1,25 @@
 # s3-sensors
 
 `no_std` Rust firmware (esp-hal + embassy) that streams an LSM303AGR accelerometer at its
-maximum rate into [QuestDB](https://questdb.io) over ILP/HTTP.
+maximum rate into [QuestDB](https://questdb.io) over
+[QWP](https://questdb.com/docs/connect/wire-protocols/qwp-ingress-websocket/), QuestDB's
+binary columnar wire protocol, with a minimal `no_std` QWP encoder in [`src/qwp.rs`](src/qwp.rs).
+Build with `--features ilp` to send ILP over HTTP instead.
+
+## QWP vs ILP, measured on the device
+
+Same stream (5.4 kHz accel + 100 Hz mag + 1 Hz health), from the `health` table:
+
+| | ILP/HTTP | QWP/WebSocket |
+|---|---|---|
+| Bytes on the wire | 271 KB/s | **72 KB/s** (3.8x less) |
+| Encoding CPU | 116 ms/s | **33 ms/s** (3.5x less) |
+| Rows/s | 5,487 | 5,485 |
+
+QWP ships the floats as raw little-endian columns and the designated timestamps
+Gorilla-encoded (~1 bit/row for a steady stream), so an accel row costs ~12 bytes against ~39
+as ILP text. Messages are pipelined (8 in flight) and acked by sequence number; ring records
+are dropped only on ack.
 
 - **Accel**: 5.376 kHz nominal (low-power 8-bit, ±4 g), drained from the 32-sample FIFO
 - **Mag**: 100 Hz
@@ -10,7 +28,7 @@ maximum rate into [QuestDB](https://questdb.io) over ILP/HTTP.
   move them. Accel samples are chained at the measured sample period (the chip's
   oscillator runs a few % off spec) and phase-locked to the read time.
 - **Buffering**: a ~1.8 MB ring in PSRAM (~50 s at full rate) rides out network or
-  QuestDB outages; records are only dropped from it after a 2xx from QuestDB.
+  QuestDB outages; records are only dropped from it once QuestDB acks them.
 
 The sensor tasks run on core 1, WiFi and the HTTP sender on core 0.
 
@@ -29,6 +47,12 @@ Configuration is compiled in from the environment:
 WIFI_SSID=... WIFI_PASSWORD=... QUESTDB_ADDR=192.168.1.10:9000 cargo run --release
 ```
 
+The QWP encoder and record encoding are core-only, so their tests run on the host:
+
+```sh
+rustc +stable --edition 2024 --test src/lib.rs -o /tmp/s3-tests && /tmp/s3-tests --nocapture
+```
+
 ## QuestDB tables
 
 ILP creates the tables on first write, but with DOUBLE columns and no TTL. Creating them
@@ -40,7 +64,8 @@ CREATE TABLE IF NOT EXISTS accel (ts TIMESTAMP, x FLOAT, y FLOAT, z FLOAT) -- m/
   TIMESTAMP(ts) PARTITION BY HOUR TTL 3 DAYS WAL;
 CREATE TABLE IF NOT EXISTS mag (ts TIMESTAMP, x FLOAT, y FLOAT, z FLOAT) -- µT
   TIMESTAMP(ts) PARTITION BY DAY TTL 30 DAYS WAL;
-CREATE TABLE IF NOT EXISTS health (ts TIMESTAMP, die_temp_c FLOAT, fifo_overruns LONG, dropped LONG)
+CREATE TABLE IF NOT EXISTS health (ts TIMESTAMP, die_temp_c FLOAT, fifo_overruns LONG, dropped LONG,
+  tx_bytes LONG, encode_us LONG) -- per-second bytes sent and µs spent encoding
   TIMESTAMP(ts) PARTITION BY MONTH WAL;
 ```
 
