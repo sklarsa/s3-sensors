@@ -46,9 +46,12 @@ CREATE TABLE IF NOT EXISTS health (ts TIMESTAMP, die_temp_c FLOAT, fifo_overruns
 
 ## Known limits
 
-- **The I2C bus is the bottleneck.** The LSM303AGR tops out at 400 kHz, and draining a full
-  FIFO takes ~4.3–5.5 ms against the 5.95 ms it takes to fill, so the polled loop still sees
-  a few FIFO overruns per second (counted in `health.fifo_overruns`; timestamps re-anchor
-  after each). Wiring INT1 to a GPIO for watermark interrupts, or a lower data rate, fixes it.
+- **The I2C bus is the bottleneck.** The LSM303AGR tops out at 400 kHz, and each sample is
+  6 bytes even in 8-bit mode (the low bytes are padding), so the accel stream uses ~75% of
+  the bus. The loop uses the blocking I2C driver on core 1 (no interrupt + wake per 32-byte
+  hardware FIFO refill) and drains at ≥4 samples, which keeps the worst gap between drains at
+  ~3.7 ms against the 5.95 ms FIFO fill time: no overruns in practice. Overruns, if any, are
+  counted in `health.fifo_overruns` and the timestamp chain re-anchors after each. Wiring INT1
+  to a GPIO for FIFO watermark interrupts would add more headroom.
 - `ACCEL_UMS2_PER_DIGIT` in `src/lib.rs` is the datasheet sensitivity; at rest the magnitude
   reads a few % under 9.81 m/s², so calibrate it if absolute values matter.

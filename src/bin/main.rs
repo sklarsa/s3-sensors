@@ -31,7 +31,7 @@ use embedded_hal_async::i2c::I2c as _;
 use embedded_io_async::Write as _;
 use esp_backtrace as _;
 use esp_hal::{
-    Async,
+    Blocking,
     clock::CpuClock,
     gpio::{Level, Output, OutputConfig},
     i2c::master::{Config as I2cConfig, I2c},
@@ -79,7 +79,26 @@ const BODY_LEN: usize = 128 * 1024;
 const TCP_TX_LEN: usize = 64 * 1024;
 const MAX_REC_ILP: usize = FIFO * 64; // worst-case ILP bytes for one record
 
-type Bus = Mutex<NoopRawMutex, I2c<'static, Async>>;
+type Bus = Mutex<NoopRawMutex, SyncI2c>;
+
+/// The blocking driver behind the async trait the lsm303agr crate wants. Core 1 runs nothing but the
+/// sensor loop, so spinning is free, and it skips the async driver's interrupt + task wake every
+/// 32-byte hardware FIFO refill (~0.2 ms each, ~1 ms per full drain).
+struct SyncI2c(I2c<'static, Blocking>);
+
+impl embedded_hal::i2c::ErrorType for SyncI2c {
+    type Error = esp_hal::i2c::master::Error;
+}
+
+impl embedded_hal_async::i2c::I2c for SyncI2c {
+    async fn transaction(
+        &mut self,
+        address: u8,
+        operations: &mut [embedded_hal::i2c::Operation<'_>],
+    ) -> Result<(), Self::Error> {
+        embedded_hal::i2c::I2c::transaction(&mut self.0, address, operations)
+    }
+}
 /// Shared across cores; every access is a short copy so the critical section stays tiny.
 type Shared = &'static BlockingMutex<CriticalSectionRawMutex, RefCell<Ring>>;
 
@@ -135,16 +154,15 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.FROM_CPU_INTR1,
         mk_static!(CoreStack<16384>, CoreStack::new()),
         move || {
-            // created here so the I2C interrupt is bound to core 1
+            // created on core 1 so only the sensor core ever touches the bus
             let i2c = I2c::new(
                 i2c0,
                 I2cConfig::default().with_frequency(Rate::from_khz(400)),
             )
             .unwrap()
             .with_sda(sda)
-            .with_scl(scl)
-            .into_async();
-            let bus: &'static Bus = mk_static!(Bus, Mutex::new(i2c));
+            .with_scl(scl);
+            let bus: &'static Bus = mk_static!(Bus, Mutex::new(SyncI2c(i2c)));
             let executor = mk_static!(
                 esp_rtos::embassy::Executor,
                 esp_rtos::embassy::Executor::new()
@@ -405,10 +423,12 @@ async fn accel_task(bus: &'static Bus, ring: Shared) {
                 }
             }
         }
-        // Draining 32 samples takes ~4.3 ms of the 400 kHz bus and the FIFO fills in 5.95 ms, so only
-        // sleep while it's nearly empty. ponytail: polled; wire INT1 to a GPIO for watermark interrupts.
-        if n < 8 {
-            Timer::after_micros(1000).await;
+        // Draining 32 samples takes ~4.4 ms of the 400 kHz bus and the FIFO fills in 5.95 ms: drain
+        // early and often, and do the side reads right after a drain when there's the most headroom.
+        // ponytail: polled; wire INT1 to a GPIO for FIFO watermark interrupts.
+        if n < 4 {
+            Timer::after_micros(500).await;
+            continue;
         }
 
         let m0 = Instant::now();

@@ -66,6 +66,7 @@ embedded-hal-async = "1.0.0"
 sntpc = { version = "0.11", default-features = false }
 sntpc-net-embassy = { version = "0.11", default-features = false }
 embassy-futures = "0.1.2"
+embedded-hal = "1"
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
