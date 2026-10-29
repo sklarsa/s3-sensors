@@ -7,7 +7,7 @@
 )]
 
 //! Feather ESP32-S3: LSM303AGR accel (5.376 kHz FIFO) + mag (100 Hz) + 1 Hz health
-//! -> PSRAM ring buffer -> ILP over HTTP to QuestDB. Timestamps are taken on the device.
+//! -> PSRAM ring buffer -> QWP over WebSocket to QuestDB. Timestamps are taken on the device.
 
 use core::cell::{Cell, RefCell};
 use core::fmt::Write as _;
@@ -17,8 +17,6 @@ use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_executor::Spawner;
-#[cfg(feature = "ilp")]
-use embassy_futures::yield_now;
 use embassy_net::{
     Runner, Stack, StackResources,
     dns::DnsQueryType,
@@ -29,7 +27,6 @@ use embassy_sync::blocking_mutex::{Mutex as BlockingMutex, raw::CriticalSectionR
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex, signal::Signal};
 use embassy_time::{Delay, Duration, Instant, Timer};
 use embedded_hal_async::i2c::I2c as _;
-#[cfg(not(feature = "ilp"))]
 use embedded_io_async::Read as _;
 use embedded_io_async::Write as _;
 use esp_backtrace as _;
@@ -52,9 +49,6 @@ use log::{error, info, warn};
 use lsm303agr::{
     AccelMode, AccelOutputDataRate, AccelScale, FifoMode, Lsm303agr, MagMode, MagOutputDataRate,
 };
-#[cfg(feature = "ilp")]
-use s3_sensors::ilp;
-#[cfg(not(feature = "ilp"))]
 use s3_sensors::qwp;
 use s3_sensors::{FIFO, MAG_BATCH, Rec, Ring};
 use sntpc::{NtpContext, NtpTimestampGenerator, get_time};
@@ -84,8 +78,6 @@ const NOMINAL_DT_NS: u32 = 1_000_000_000 / 5376;
 
 const BODY_LEN: usize = 128 * 1024;
 const TCP_TX_LEN: usize = 64 * 1024;
-#[cfg(feature = "ilp")]
-const MAX_REC_ILP: usize = FIFO * 64; // worst-case ILP bytes for one record
 const SCRATCH_RECS: usize = 256; // records per QWP message (8192 accel rows max)
 
 type Bus = Mutex<NoopRawMutex, SyncI2c>;
@@ -508,91 +500,6 @@ impl core::fmt::Write for SliceWriter<'_> {
     }
 }
 
-/// Sends the oldest records as one ILP/HTTP request; pops them only on a 2xx.
-#[cfg(feature = "ilp")]
-#[embassy_executor::task]
-async fn sender(
-    stack: Stack<'static>,
-    ring: Shared,
-    body: &'static mut [u8],
-    tcp_tx: &'static mut [u8],
-    _scratch: &'static mut [MaybeUninit<Rec>],
-) {
-    let mut tcp_rx = [0u8; 2048];
-    let mut resp = [0u8; 1024];
-    let questdb: SocketAddrV4 = QUESTDB.parse().expect("QUESTDB_ADDR must be ipv4:port");
-    stack.wait_config_up().await;
-    loop {
-        let mut sock = TcpSocket::new(stack, &mut tcp_rx, &mut *tcp_tx);
-        sock.set_timeout(Some(Duration::from_secs(10)));
-        if let Err(e) = sock.connect((*questdb.ip(), questdb.port())).await {
-            warn!("questdb connect: {e:?}");
-            Timer::after_secs(2).await;
-            continue;
-        }
-        info!("questdb connected");
-        loop {
-            while ring.lock(|r| r.borrow().is_empty()) {
-                Timer::after_millis(20).await;
-            }
-            let mut w = SliceWriter {
-                buf: &mut *body,
-                len: 0,
-            };
-            let mut k = 0;
-            let mut encode = Duration::from_ticks(0);
-            while w.buf.len() - w.len >= MAX_REC_ILP {
-                let r = ring.lock(|r| r.borrow().get(k));
-                let Some(r) = r else { break };
-                let t0 = Instant::now();
-                ilp(&mut w, &r).unwrap();
-                encode += t0.elapsed();
-                k += 1;
-                yield_now().await;
-            }
-            let len = w.len;
-            ENCODE_US.fetch_add(encode.as_micros() as u32, Relaxed);
-
-            let mut hdr = [0u8; 128];
-            let mut h = SliceWriter {
-                buf: &mut hdr,
-                len: 0,
-            };
-            write!(
-                h,
-                "POST /write?precision=u HTTP/1.1\r\nHost: questdb\r\nContent-Length: {len}\r\n\r\n"
-            )
-            .unwrap();
-            let hlen = h.len;
-            let sent = async {
-                sock.write_all(&hdr[..hlen]).await?;
-                sock.write_all(&body[..len]).await?;
-                TX_BYTES.fetch_add((hlen + len) as u32, Relaxed);
-                read_status(&mut sock, &mut resp).await
-            }
-            .await;
-            match sent {
-                Ok(200..=299) => ring.lock(|r| r.borrow_mut().pop(k)),
-                Ok(code @ 400..=499) => {
-                    // bad data will never succeed; drop it rather than wedge the ring
-                    error!(
-                        "questdb {code}, dropping {k} records: {}",
-                        core::str::from_utf8(&resp).unwrap_or("")
-                    );
-                    ring.lock(|r| r.borrow_mut().pop(k));
-                }
-                r => {
-                    warn!("questdb send failed: {r:?}, reconnecting");
-                    break;
-                }
-            }
-        }
-        sock.abort();
-        let _ = sock.flush().await;
-        Timer::after_secs(1).await;
-    }
-}
-
 /// Reads an HTTP/1.1 response head into `buf`: `(status code, head length, bytes read)`.
 async fn read_head(
     sock: &mut TcpSocket<'_>,
@@ -625,35 +532,9 @@ fn header<'a>(head: &'a [u8], name: &str) -> Option<&'a str> {
     })
 }
 
-/// Reads one HTTP/1.1 response, consuming its body so the connection can be reused.
-#[cfg(feature = "ilp")]
-async fn read_status(
-    sock: &mut TcpSocket<'_>,
-    buf: &mut [u8],
-) -> Result<u16, embassy_net::tcp::Error> {
-    let (code, head_end, n) = read_head(sock, buf).await?;
-    let body_len: usize = header(&buf[..head_end], "content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    // keep the start of an error body in buf for logging, discard the rest
-    buf.copy_within(head_end..n, 0);
-    let mut have = n - head_end;
-    while have < body_len {
-        let mut sink = [0u8; 256];
-        let r = sock.read(&mut sink).await?;
-        if r == 0 {
-            return Err(embassy_net::tcp::Error::ConnectionReset);
-        }
-        have += r;
-    }
-    buf[(n - head_end).min(body_len)..].fill(0);
-    Ok(code)
-}
-
 /// QWP over WebSocket: upgrade, then stream binary messages (up to MAX_INFLIGHT unacked). Records
 /// are popped from the ring only when QuestDB acks the message that carried them; on reconnect
 /// everything unacked is re-sent.
-#[cfg(not(feature = "ilp"))]
 #[embassy_executor::task]
 async fn sender(
     stack: Stack<'static>,
@@ -795,7 +676,6 @@ async fn sender(
 }
 
 /// WebSocket upgrade to QWP; returns the payload budget (90% of the server's advertised max).
-#[cfg(not(feature = "ilp"))]
 async fn qwp_upgrade(
     sock: &mut TcpSocket<'_>,
     buf: &mut [u8],

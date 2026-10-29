@@ -4,11 +4,11 @@
 maximum rate into [QuestDB](https://questdb.io) over
 [QWP](https://questdb.com/docs/connect/wire-protocols/qwp-ingress-websocket/), QuestDB's
 binary columnar wire protocol, with a minimal `no_std` QWP encoder in [`src/qwp.rs`](src/qwp.rs).
-Build with `--features ilp` to send ILP over HTTP instead.
 
 ## QWP vs ILP, measured on the device
 
-Same stream (5.4 kHz accel + 100 Hz mag + 1 Hz health), from the `health` table:
+Same stream (5.4 kHz accel + 100 Hz mag + 1 Hz health), from the `health` table, measured
+against an ILP/HTTP sender (since removed, see git history):
 
 | | ILP/HTTP | QWP/WebSocket |
 |---|---|---|
@@ -21,6 +21,9 @@ Gorilla-encoded (~1 bit/row for a steady stream), so an accel row costs ~12 byte
 as ILP text. Messages are pipelined (8 in flight) and acked by sequence number; ring records
 are dropped only on ack.
 
+After a 30 s QuestDB outage the ring drained at ~805 KB/s (~62k rows/s, 11x the live rate) and
+caught up in ~4 s, with no rows lost.
+
 - **Accel**: 5.376 kHz nominal (low-power 8-bit, ±4 g), drained from the 32-sample FIFO
 - **Mag**: 100 Hz
 - **Health**: 1 Hz die temperature, FIFO overruns, dropped records
@@ -30,7 +33,7 @@ are dropped only on ack.
 - **Buffering**: a ~1.8 MB ring in PSRAM (~50 s at full rate) rides out network or
   QuestDB outages; records are only dropped from it once QuestDB acks them.
 
-The sensor tasks run on core 1, WiFi and the HTTP sender on core 0.
+The sensor tasks run on core 1, WiFi and the QWP sender on core 0.
 
 ## Hardware
 
@@ -55,7 +58,7 @@ rustc +stable --edition 2024 --test src/lib.rs -o /tmp/s3-tests && /tmp/s3-tests
 
 ## QuestDB tables
 
-ILP creates the tables on first write, but with DOUBLE columns and no TTL. Creating them
+QWP creates the tables on first write, but with DOUBLE columns and no TTL. Creating them
 first halves the storage. At full rate `accel` is ~20 GB/day on disk and ~45 GB/day of
 writes, so put QuestDB on an SSD, not an SD card.
 

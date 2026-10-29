@@ -2,7 +2,6 @@
 
 pub mod qwp;
 
-use core::fmt::Write;
 use core::mem::MaybeUninit;
 
 /// Accel FIFO depth on the LSM303AGR.
@@ -96,66 +95,6 @@ fn accel_ms2(raw: i16) -> f32 {
 /// Timestamp of sample `i` of an accel record whose newest sample is at `t_us`.
 fn sample_us(t_us: i64, dt_ns: u32, n: u8, i: usize) -> i64 {
     t_us - (n as i64 - 1 - i as i64) * dt_ns as i64 / 1000
-}
-
-/// Write `v / 10^decimals` as a decimal without touching floats (fast on the ESP32).
-fn fixed(out: &mut impl Write, v: i64, decimals: u32) -> core::fmt::Result {
-    let p = 10i64.pow(decimals);
-    let sign = if v < 0 { "-" } else { "" };
-    let a = v.unsigned_abs();
-    write!(
-        out,
-        "{sign}{}.{:0w$}",
-        a / p as u64,
-        a % p as u64,
-        w = decimals as usize
-    )
-}
-
-/// Append a record as ILP lines (timestamps in µs, POST with `precision=u`).
-pub fn ilp(out: &mut impl Write, r: &Rec) -> core::fmt::Result {
-    match *r {
-        Rec::Accel {
-            t_us,
-            dt_ns,
-            n,
-            xyz,
-        } => {
-            for (i, s) in xyz[..n as usize].iter().enumerate() {
-                out.write_str("accel x=")?;
-                fixed(out, accel_ums2(s[0]) / 1000, 3)?; // mm/s², resolution is ~0.3 m/s² anyway
-                out.write_str(",y=")?;
-                fixed(out, accel_ums2(s[1]) / 1000, 3)?;
-                out.write_str(",z=")?;
-                fixed(out, accel_ums2(s[2]) / 1000, 3)?;
-                writeln!(out, " {}", sample_us(t_us, dt_ns, n, i))?;
-            }
-        }
-        Rec::Mag { n, t_us, xyz_nt } => {
-            for i in 0..n as usize {
-                let [x, y, z] = xyz_nt[i];
-                out.write_str("mag x=")?;
-                fixed(out, x as i64, 3)?; // nT -> µT
-                out.write_str(",y=")?;
-                fixed(out, y as i64, 3)?;
-                out.write_str(",z=")?;
-                fixed(out, z as i64, 3)?;
-                writeln!(out, " {}", t_us[i])?;
-            }
-        }
-        Rec::Health {
-            t_us,
-            die_temp_c,
-            fifo_overruns,
-            dropped,
-            tx_bytes,
-            encode_us,
-        } => writeln!(
-            out,
-            "health die_temp_c={die_temp_c:.1},fifo_overruns={fifo_overruns}i,dropped={dropped}i,tx_bytes={tx_bytes}i,encode_us={encode_us}i {t_us}"
-        )?,
-    }
-    Ok(())
 }
 
 /// Encodes records as one QWP message with up to three table blocks: accel, mag, health.
@@ -257,23 +196,18 @@ mod tests {
         }
     }
 
-    /// 1024 rows of steady-rate accel: QWP should be ~13 bytes/row (3 floats + ~1 bit of
-    /// timestamp) against ~45 for the same rows as ILP text.
+    /// 1024 rows of steady-rate accel: ~13 bytes/row (3 floats + ~1 bit of timestamp).
     #[test]
-    fn qwp_vs_ilp_size() {
+    fn qwp_size() {
         let recs: std::vec::Vec<Rec> = (0..32)
             .map(|i| accel_rec(1_000_000 + i * 32 * 182))
             .collect();
         let mut buf = std::vec![0u8; 64 * 1024];
         let qwp = qwp_message(&mut buf, &recs).unwrap();
-        let mut ilp_text = std::string::String::new();
-        recs.iter().for_each(|r| ilp(&mut ilp_text, r).unwrap());
         let rows = 32 * FIFO;
         std::println!(
-            "{rows} rows: qwp {qwp} B ({:.1} B/row), ilp {} B ({:.1} B/row)",
-            qwp as f64 / rows as f64,
-            ilp_text.len(),
-            ilp_text.len() as f64 / rows as f64
+            "{rows} rows: {qwp} B ({:.1} B/row)",
+            qwp as f64 / rows as f64
         );
         assert!(qwp < rows * 13, "{qwp}");
         assert_eq!(buf[6], 1); // one table
