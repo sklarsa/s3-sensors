@@ -3,6 +3,7 @@ edition      = "2024"
 name         = "s3-sensors"
 rust-version = "1.95"
 version      = "0.1.0"
+license      = "MIT"
 
 [[bin]]
 name = "s3-sensors"
