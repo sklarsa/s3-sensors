@@ -27,7 +27,8 @@ caught up in ~4 s, with no rows lost.
 - **Accel**: 5.376 kHz nominal (low-power 8-bit, ±4 g), drained from the 32-sample FIFO
 - **Mag**: 100 Hz
 - **Health**: 1 Hz die temperature, FIFO overruns, dropped records, WiFi AP/channel/RSSI,
-  free heap, disconnect and reconnect counts, ring depth
+  free heap, disconnect and reconnect counts, ring depth, frames in and out of the WiFi driver,
+  uptime and reset reason (a panic reboots)
 - **Timestamps** are taken on the device (SNTP-synced), so network delay and retries don't
   move them. Accel samples are chained at the measured sample period (the chip's
   oscillator runs a few % off spec) and phase-locked to the read time.
@@ -72,7 +73,9 @@ CREATE TABLE IF NOT EXISTS health (ts TIMESTAMP, die_temp_c FLOAT, fifo_overruns
   tx_bytes LONG, encode_us LONG, -- per-second bytes sent and µs spent encoding
   rssi_dbm LONG, ap_bssid LONG, wifi_channel LONG, -- 0 when not associated; bssid is the MAC as an integer
   heap_free LONG, wifi_disconnects LONG, qwp_reconnects LONG, -- counts are cumulative since boot
-  ring_len LONG) -- records waiting for an ack
+  ring_len LONG, -- records waiting for an ack
+  drv_rx_frames LONG, drv_tx_frames LONG, drv_tx_bytes LONG, drv_tx_busy LONG, -- TCP stack <-> WiFi driver, cumulative
+  qwp_acks LONG, uptime_s LONG, reset_reason LONG)
   TIMESTAMP(ts) PARTITION BY MONTH WAL;
 ```
 

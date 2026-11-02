@@ -23,12 +23,14 @@ esp-rtos = { version = "0.4.0", features = [
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3", "log-04"] }
 log                    = "0.4.27"
 
+embassy-net-driver = "0.2.0"
 embassy-net = { version = "0.9.1", features = ["dhcpv4", "dns", "log", "medium-ethernet", "tcp", "udp"] }
 embedded-io = "0.7.1"
 embedded-io-async = "0.7.0"
 esp-alloc = { version = "0.11.0", features = ["esp32s3"] }
 esp-backtrace = { version = "0.20.0", features = [
   "esp32s3",
+  "custom-halt",
   "panic-handler",
   "println",
 ] }

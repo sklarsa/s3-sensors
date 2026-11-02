@@ -42,6 +42,17 @@ pub enum Rec {
         qwp_reconnects: u32,
         /// records waiting to be acked by QuestDB
         ring_len: u32,
+        /// cumulative since boot, at the boundary between the TCP stack and the WiFi driver
+        drv_rx_frames: u32,
+        drv_tx_frames: u32,
+        drv_tx_bytes: u32,
+        /// times the driver had no room to transmit
+        drv_tx_busy: u32,
+        /// QWP messages acked by QuestDB, cumulative since boot
+        qwp_acks: u32,
+        uptime_s: u32,
+        /// esp-hal's SocResetReason for the last boot
+        reset_reason: u32,
     },
 }
 
@@ -173,6 +184,13 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
                 wifi_disconnects,
                 qwp_reconnects,
                 ring_len,
+                drv_rx_frames,
+                drv_tx_frames,
+                drv_tx_bytes,
+                drv_tx_busy,
+                qwp_acks,
+                uptime_s,
+                reset_reason,
             } => Some((
                 t_us,
                 die_temp_c,
@@ -188,6 +206,13 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
                     wifi_disconnects as i64,
                     qwp_reconnects as i64,
                     ring_len as i64,
+                    drv_rx_frames as i64,
+                    drv_tx_frames as i64,
+                    drv_tx_bytes as i64,
+                    drv_tx_busy as i64,
+                    qwp_acks as i64,
+                    uptime_s as i64,
+                    reset_reason as i64,
                 ],
             )),
             _ => None,
@@ -208,6 +233,13 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
             ("wifi_disconnects", LONG),
             ("qwp_reconnects", LONG),
             ("ring_len", LONG),
+            ("drv_rx_frames", LONG),
+            ("drv_tx_frames", LONG),
+            ("drv_tx_bytes", LONG),
+            ("drv_tx_busy", LONG),
+            ("qwp_acks", LONG),
+            ("uptime_s", LONG),
+            ("reset_reason", LONG),
         ];
         e.table("health", rows, &cols)?;
         e.f32s(health().map(|h| h.1))?;
@@ -267,6 +299,13 @@ mod tests {
             wifi_disconnects: 0,
             qwp_reconnects: 0,
             ring_len: 0,
+            drv_rx_frames: 0,
+            drv_tx_frames: 0,
+            drv_tx_bytes: 0,
+            drv_tx_busy: 0,
+            qwp_acks: 0,
+            uptime_s: 0,
+            reset_reason: 0,
         };
         let mut buf = std::vec![0u8; 1024];
         let n = qwp_message(&mut buf, &[rec]).unwrap();

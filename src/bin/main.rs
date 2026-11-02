@@ -117,6 +117,76 @@ static WIFI_CHANNEL: AtomicU32 = AtomicU32::new(0);
 static HEAP_FREE: AtomicU32 = AtomicU32::new(0);
 static WIFI_DISCONNECTS: AtomicU32 = AtomicU32::new(0);
 static QWP_RECONNECTS: AtomicU32 = AtomicU32::new(0);
+static QWP_ACKS: AtomicU32 = AtomicU32::new(0);
+static RESET_REASON: AtomicU32 = AtomicU32::new(0);
+// Frames crossing the boundary between the TCP stack and the WiFi driver, cumulative
+static DRV_RX_FRAMES: AtomicU32 = AtomicU32::new(0);
+static DRV_TX_FRAMES: AtomicU32 = AtomicU32::new(0);
+static DRV_TX_BYTES: AtomicU32 = AtomicU32::new(0);
+static DRV_TX_BUSY: AtomicU32 = AtomicU32::new(0);
+
+/// A panic reboots rather than spinning forever with the other core still running.
+#[unsafe(no_mangle)]
+fn custom_halt() -> ! {
+    esp_hal::system::software_reset()
+}
+
+/// Wraps the WiFi driver to count what crosses into and out of the TCP stack, so a stall can be
+/// placed above or below this line.
+struct Counting<D>(D);
+struct CountingRx<T>(T);
+struct CountingTx<T>(T);
+
+impl<T: embassy_net_driver::RxToken> embassy_net_driver::RxToken for CountingRx<T> {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, f: F) -> R {
+        DRV_RX_FRAMES.fetch_add(1, Relaxed);
+        self.0.consume(f)
+    }
+}
+
+impl<T: embassy_net_driver::TxToken> embassy_net_driver::TxToken for CountingTx<T> {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+        DRV_TX_FRAMES.fetch_add(1, Relaxed);
+        DRV_TX_BYTES.fetch_add(len as u32, Relaxed);
+        self.0.consume(len, f)
+    }
+}
+
+impl<D: embassy_net_driver::Driver> embassy_net_driver::Driver for Counting<D> {
+    type RxToken<'a>
+        = CountingRx<D::RxToken<'a>>
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = CountingTx<D::TxToken<'a>>
+    where
+        Self: 'a;
+
+    fn receive(
+        &mut self,
+        cx: &mut core::task::Context,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        self.0
+            .receive(cx)
+            .map(|(rx, tx)| (CountingRx(rx), CountingTx(tx)))
+    }
+    fn transmit(&mut self, cx: &mut core::task::Context) -> Option<Self::TxToken<'_>> {
+        let tx = self.0.transmit(cx);
+        if tx.is_none() {
+            DRV_TX_BUSY.fetch_add(1, Relaxed);
+        }
+        tx.map(CountingTx)
+    }
+    fn link_state(&mut self, cx: &mut core::task::Context) -> embassy_net_driver::LinkState {
+        self.0.link_state(cx)
+    }
+    fn capabilities(&self) -> embassy_net_driver::Capabilities {
+        self.0.capabilities()
+    }
+    fn hardware_address(&self) -> embassy_net_driver::HardwareAddress {
+        self.0.hardware_address()
+    }
+}
 // debug: worst-case µs per 10 s window
 static MAX_GAP_US: AtomicU32 = AtomicU32::new(0);
 static MAX_BURST_US: AtomicU32 = AtomicU32::new(0);
@@ -129,6 +199,9 @@ fn now_us() -> i64 {
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
+    let reset_reason = esp_hal::system::reset_reason();
+    info!("reset reason: {reset_reason:?}");
+    RESET_REASON.store(reset_reason.map_or(0, |r| r as u32), Relaxed);
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
@@ -202,7 +275,7 @@ async fn main(spawner: Spawner) -> ! {
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
     let (stack, runner) = embassy_net::new(
-        Interface::station(),
+        Counting(Interface::station()),
         embassy_net::Config::dhcpv4(Default::default()),
         mk_static!(StackResources<4>, StackResources::<4>::new()),
         seed,
@@ -285,7 +358,7 @@ async fn connection(mut controller: WifiController<'static>) {
 }
 
 #[embassy_executor::task]
-async fn net_task(mut runner: Runner<'static, Interface>) {
+async fn net_task(mut runner: Runner<'static, Counting<Interface>>) {
     runner.run().await
 }
 
@@ -530,6 +603,13 @@ async fn accel_task(bus: &'static Bus, ring: Shared) {
                     wifi_disconnects: WIFI_DISCONNECTS.load(Relaxed),
                     qwp_reconnects: QWP_RECONNECTS.load(Relaxed),
                     ring_len,
+                    drv_rx_frames: DRV_RX_FRAMES.load(Relaxed),
+                    drv_tx_frames: DRV_TX_FRAMES.load(Relaxed),
+                    drv_tx_bytes: DRV_TX_BYTES.load(Relaxed),
+                    drv_tx_busy: DRV_TX_BUSY.load(Relaxed),
+                    qwp_acks: QWP_ACKS.load(Relaxed),
+                    uptime_s: Instant::now().as_secs() as u32,
+                    reset_reason: RESET_REASON.load(Relaxed),
                 });
             });
         }
@@ -661,6 +741,7 @@ async fn sender(
                                     }
                                 }
                                 next_seq += 1;
+                                QWP_ACKS.fetch_add(1, Relaxed);
                                 ring.lock(|r| r.borrow_mut().pop(inflight[0]));
                                 sent -= inflight[0];
                                 inflight.copy_within(1..nin, 0);
