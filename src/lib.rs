@@ -31,6 +31,17 @@ pub enum Rec {
         /// bytes put on the wire and µs spent encoding them, over the last second
         tx_bytes: u32,
         encode_us: u32,
+        /// signal from the AP's last beacon; 0 when not associated
+        rssi_dbm: i32,
+        /// connected AP's MAC as a 48-bit integer and its channel; 0 when not associated
+        ap_bssid: u64,
+        wifi_channel: u8,
+        heap_free: u32,
+        /// cumulative since boot
+        wifi_disconnects: u32,
+        qwp_reconnects: u32,
+        /// records waiting to be acked by QuestDB
+        ring_len: u32,
     },
 }
 
@@ -155,10 +166,29 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
                 dropped,
                 tx_bytes,
                 encode_us,
+                rssi_dbm,
+                ap_bssid,
+                wifi_channel,
+                heap_free,
+                wifi_disconnects,
+                qwp_reconnects,
+                ring_len,
             } => Some((
                 t_us,
                 die_temp_c,
-                [fifo_overruns, dropped, tx_bytes, encode_us],
+                [
+                    fifo_overruns as i64,
+                    dropped as i64,
+                    tx_bytes as i64,
+                    encode_us as i64,
+                    rssi_dbm as i64,
+                    ap_bssid as i64,
+                    wifi_channel as i64,
+                    heap_free as i64,
+                    wifi_disconnects as i64,
+                    qwp_reconnects as i64,
+                    ring_len as i64,
+                ],
             )),
             _ => None,
         })
@@ -171,11 +201,18 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
             ("dropped", LONG),
             ("tx_bytes", LONG),
             ("encode_us", LONG),
+            ("rssi_dbm", LONG),
+            ("ap_bssid", LONG),
+            ("wifi_channel", LONG),
+            ("heap_free", LONG),
+            ("wifi_disconnects", LONG),
+            ("qwp_reconnects", LONG),
+            ("ring_len", LONG),
         ];
         e.table("health", rows, &cols)?;
         e.f32s(health().map(|h| h.1))?;
-        for c in 0..4 {
-            e.i64s(health().map(|h| h.2[c] as i64))?;
+        for c in 0..cols.len() - 1 {
+            e.i64s(health().map(|h| h.2[c]))?;
         }
         e.timestamps(health().map(|h| h.0))?;
     }
@@ -211,5 +248,30 @@ mod tests {
         );
         assert!(qwp < rows * 13, "{qwp}");
         assert_eq!(buf[6], 1); // one table
+    }
+
+    /// RSSI must keep its sign and the BSSID its full 48 bits on the way into LONG columns.
+    #[test]
+    fn health_wifi_columns() {
+        let rec = Rec::Health {
+            t_us: 1_000_000,
+            die_temp_c: 24.0,
+            fifo_overruns: 0,
+            dropped: 0,
+            tx_bytes: 0,
+            encode_us: 0,
+            rssi_dbm: -57,
+            ap_bssid: 0xfedc_ba98_7654,
+            wifi_channel: 1,
+            heap_free: 0,
+            wifi_disconnects: 0,
+            qwp_reconnects: 0,
+            ring_len: 0,
+        };
+        let mut buf = std::vec![0u8; 1024];
+        let n = qwp_message(&mut buf, &[rec]).unwrap();
+        let has = |v: i64| buf[..n].windows(8).any(|w| w == v.to_le_bytes());
+        assert!(has(-57));
+        assert!(has(0xfedc_ba98_7654));
     }
 }

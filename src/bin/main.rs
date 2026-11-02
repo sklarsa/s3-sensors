@@ -13,7 +13,7 @@ use core::cell::{Cell, RefCell};
 use core::fmt::Write as _;
 use core::mem::MaybeUninit;
 use core::net::{IpAddr, SocketAddr, SocketAddrV4};
-use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering::Relaxed};
 
 use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_executor::Spawner;
@@ -25,7 +25,7 @@ use embassy_net::{
 };
 use embassy_sync::blocking_mutex::{Mutex as BlockingMutex, raw::CriticalSectionRawMutex};
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex, signal::Signal};
-use embassy_time::{Delay, Duration, Instant, Timer};
+use embassy_time::{Delay, Duration, Instant, Timer, with_timeout};
 use embedded_hal_async::i2c::I2c as _;
 use embedded_io_async::Read as _;
 use embedded_io_async::Write as _;
@@ -110,6 +110,13 @@ static FIFO_OVERRUNS: AtomicU32 = AtomicU32::new(0);
 // bytes on the wire and µs spent encoding; swapped into the 1 Hz health row
 static TX_BYTES: AtomicU32 = AtomicU32::new(0);
 static ENCODE_US: AtomicU32 = AtomicU32::new(0);
+// WiFi state for the 1 Hz health row; 0 when not associated (heap_free keeps its last value)
+static RSSI_DBM: AtomicI32 = AtomicI32::new(0);
+static AP_BSSID: critical_section::Mutex<Cell<u64>> = critical_section::Mutex::new(Cell::new(0)); // no 64-bit atomics on Xtensa
+static WIFI_CHANNEL: AtomicU32 = AtomicU32::new(0);
+static HEAP_FREE: AtomicU32 = AtomicU32::new(0);
+static WIFI_DISCONNECTS: AtomicU32 = AtomicU32::new(0);
+static QWP_RECONNECTS: AtomicU32 = AtomicU32::new(0);
 // debug: worst-case µs per 10 s window
 static MAX_GAP_US: AtomicU32 = AtomicU32::new(0);
 static MAX_BURST_US: AtomicU32 = AtomicU32::new(0);
@@ -210,7 +217,8 @@ async fn main(spawner: Spawner) -> ! {
         Timer::after_secs(10).await;
         let (len, dropped) = ring.lock(|r| (r.borrow().len(), r.borrow().dropped));
         info!(
-            "ring {len}/{cap} dropped={dropped} fifo_overruns={} max_gap={}µs max_burst={}µs max_mag={}µs",
+            "ring {len}/{cap} dropped={dropped} rssi={}dBm fifo_overruns={} max_gap={}µs max_burst={}µs max_mag={}µs",
+            RSSI_DBM.load(Relaxed),
             FIFO_OVERRUNS.load(Relaxed),
             MAX_GAP_US.swap(0, Relaxed),
             MAX_BURST_US.swap(0, Relaxed),
@@ -229,8 +237,46 @@ async fn connection(mut controller: WifiController<'static>) {
         match controller.connect_async().await {
             Ok(_) => {
                 info!("wifi connected");
-                let _ = controller.wait_for_disconnect_async().await;
-                warn!("wifi disconnected");
+                let mut secs = 0u32;
+                let gone = loop {
+                    match with_timeout(Duration::from_secs(1), controller.wait_for_disconnect_async())
+                        .await
+                    {
+                        Ok(r) => break r,
+                        Err(_) => {}
+                    }
+                    RSSI_DBM.store(controller.rssi().unwrap_or(0), Relaxed);
+                    HEAP_FREE.store(esp_alloc::HEAP.free() as u32, Relaxed);
+                    match controller.ap_info() {
+                        Ok(ap) => {
+                            let bssid = ap.bssid.iter().fold(0u64, |a, b| a << 8 | *b as u64);
+                            critical_section::with(|cs| AP_BSSID.borrow(cs).set(bssid));
+                            WIFI_CHANNEL.store(ap.channel as u32, Relaxed);
+                            if secs % 10 == 0 {
+                                info!(
+                                    "ap {:02x?} ch{} beacon_rssi={} heap_free={}",
+                                    ap.bssid,
+                                    ap.channel,
+                                    ap.signal_strength,
+                                    esp_alloc::HEAP.free()
+                                );
+                            }
+                        }
+                        Err(e) => warn!("ap_info: {e:?}"),
+                    }
+                    secs += 1;
+                };
+                RSSI_DBM.store(0, Relaxed);
+                critical_section::with(|cs| AP_BSSID.borrow(cs).set(0));
+                WIFI_CHANNEL.store(0, Relaxed);
+                WIFI_DISCONNECTS.fetch_add(1, Relaxed);
+                match gone {
+                    Ok(i) => warn!(
+                        "wifi disconnected after {secs} s: ap {:02x?} reason {:?} rssi {}",
+                        i.bssid, i.reason, i.rssi
+                    ),
+                    Err(e) => warn!("wifi disconnected after {secs} s: {e:?}"),
+                }
             }
             Err(e) => error!("wifi connect failed: {e:?}"),
         }
@@ -469,7 +515,7 @@ async fn accel_task(bus: &'static Bus, ring: Shared) {
                 .unwrap_or(f32::NAN);
             ring.lock(|r| {
                 let mut r = r.borrow_mut();
-                let dropped = r.dropped;
+                let (dropped, ring_len) = (r.dropped, r.len() as u32);
                 r.push(Rec::Health {
                     t_us: now_us(),
                     die_temp_c,
@@ -477,6 +523,13 @@ async fn accel_task(bus: &'static Bus, ring: Shared) {
                     dropped,
                     tx_bytes: TX_BYTES.swap(0, Relaxed),
                     encode_us: ENCODE_US.swap(0, Relaxed),
+                    rssi_dbm: RSSI_DBM.load(Relaxed),
+                    ap_bssid: critical_section::with(|cs| AP_BSSID.borrow(cs).get()),
+                    wifi_channel: WIFI_CHANNEL.load(Relaxed) as u8,
+                    heap_free: HEAP_FREE.load(Relaxed),
+                    wifi_disconnects: WIFI_DISCONNECTS.load(Relaxed),
+                    qwp_reconnects: QWP_RECONNECTS.load(Relaxed),
+                    ring_len,
                 });
             });
         }
@@ -667,6 +720,7 @@ async fn sender(
         }
         .await;
         if let Err(e) = result {
+            QWP_RECONNECTS.fetch_add(1, Relaxed);
             warn!("qwp: {e}, reconnecting");
         }
         sock.abort();
