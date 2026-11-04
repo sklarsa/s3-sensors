@@ -118,6 +118,12 @@ static HEAP_FREE: AtomicU32 = AtomicU32::new(0);
 static WIFI_DISCONNECTS: AtomicU32 = AtomicU32::new(0);
 static QWP_RECONNECTS: AtomicU32 = AtomicU32::new(0);
 static QWP_ACKS: AtomicU32 = AtomicU32::new(0);
+static QWP_REJECTED: AtomicU32 = AtomicU32::new(0);
+static QWP_LAST_ERROR: AtomicU32 = AtomicU32::new(0);
+/// Newest health row that didn't fit in a full ring. The sender sends it ahead of the backlog, so
+/// a stall still reports itself instead of going silent.
+static LATEST_HEALTH: critical_section::Mutex<Cell<Option<Rec>>> =
+    critical_section::Mutex::new(Cell::new(None));
 static RESET_REASON: AtomicU32 = AtomicU32::new(0);
 // Frames crossing the boundary between the TCP stack and the WiFi driver, cumulative
 static DRV_RX_FRAMES: AtomicU32 = AtomicU32::new(0);
@@ -589,7 +595,7 @@ async fn accel_task(bus: &'static Bus, ring: Shared) {
             ring.lock(|r| {
                 let mut r = r.borrow_mut();
                 let (dropped, ring_len) = (r.dropped, r.len() as u32);
-                r.push(Rec::Health {
+                let health = Rec::Health {
                     t_us: now_us(),
                     die_temp_c,
                     fifo_overruns: FIFO_OVERRUNS.load(Relaxed),
@@ -608,9 +614,16 @@ async fn accel_task(bus: &'static Bus, ring: Shared) {
                     drv_tx_bytes: DRV_TX_BYTES.load(Relaxed),
                     drv_tx_busy: DRV_TX_BUSY.load(Relaxed),
                     qwp_acks: QWP_ACKS.load(Relaxed),
+                    qwp_rejected: QWP_REJECTED.load(Relaxed),
+                    qwp_last_error: QWP_LAST_ERROR.load(Relaxed),
                     uptime_s: Instant::now().as_secs() as u32,
                     reset_reason: RESET_REASON.load(Relaxed),
-                });
+                };
+                if r.len() == r.capacity() {
+                    critical_section::with(|cs| LATEST_HEALTH.borrow(cs).set(Some(health)));
+                } else {
+                    r.push(health);
+                }
             });
         }
     }
@@ -699,6 +712,20 @@ async fn sender(
                 ([0usize; MAX_INFLIGHT], 0, 0, 0i64);
             let mut last_send = Instant::now();
             loop {
+                if nin < MAX_INFLIGHT
+                    && let Some(h) = critical_section::with(|cs| LATEST_HEALTH.borrow(cs).take())
+                {
+                    let len = s3_sensors::qwp_message(&mut body[14..14 + max_payload], &[h])
+                        .map_err(|_| "record exceeds max payload")?;
+                    let start = ws_frame(body, len, &rng);
+                    sock.write_all(&body[start..14 + len])
+                        .await
+                        .map_err(|_| "write")?;
+                    TX_BYTES.fetch_add((14 + len - start) as u32, Relaxed);
+                    inflight[nin] = 0; // not from the ring, so an ack pops nothing
+                    nin += 1;
+                    continue;
+                }
                 let unsent = ring.lock(|r| r.borrow().len()) - sent;
                 // batch like the reference client: ~100 ms or a full scratch of records
                 let due = unsent >= SCRATCH_RECS / 4
@@ -739,6 +766,7 @@ async fn sender(
                                     {
                                         return Err("server error");
                                     }
+                                    QWP_REJECTED.fetch_add(1, Relaxed);
                                 }
                                 next_seq += 1;
                                 QWP_ACKS.fetch_add(1, Relaxed);
@@ -783,16 +811,12 @@ async fn sender(
                         Err(_) => return Err("record exceeds max payload"),
                     }
                 };
-                let mask = rng.random().to_le_bytes();
-                qwp::ws_mask(&mut body[14..14 + len], mask);
-                let mut f = [0u8; 14];
-                let hl = qwp::ws_header(&mut f, qwp::WS_BINARY, len, mask);
-                body[14 - hl..14].copy_from_slice(&f[..hl]);
+                let start = ws_frame(body, len, &rng);
                 ENCODE_US.fetch_add(t0.elapsed().as_micros() as u32, Relaxed);
-                sock.write_all(&body[14 - hl..14 + len])
+                sock.write_all(&body[start..14 + len])
                     .await
                     .map_err(|_| "write")?;
-                TX_BYTES.fetch_add((hl + len) as u32, Relaxed);
+                TX_BYTES.fetch_add((14 + len - start) as u32, Relaxed);
                 inflight[nin] = k;
                 nin += 1;
                 sent += k;
@@ -802,12 +826,24 @@ async fn sender(
         .await;
         if let Err(e) = result {
             QWP_RECONNECTS.fetch_add(1, Relaxed);
+            QWP_LAST_ERROR.store(s3_sensors::qwp_err_code(e), Relaxed);
             warn!("qwp: {e}, reconnecting");
         }
         sock.abort();
         let _ = sock.flush().await;
         Timer::after_secs(1).await;
     }
+}
+
+/// Masks the payload at `body[14..14 + len]` and writes a binary frame header just before it;
+/// returns where the frame starts.
+fn ws_frame(body: &mut [u8], len: usize, rng: &Rng) -> usize {
+    let mask = rng.random().to_le_bytes();
+    qwp::ws_mask(&mut body[14..14 + len], mask);
+    let mut f = [0u8; 14];
+    let hl = qwp::ws_header(&mut f, qwp::WS_BINARY, len, mask);
+    body[14 - hl..14].copy_from_slice(&f[..hl]);
+    14 - hl
 }
 
 /// WebSocket upgrade to QWP; returns the payload budget (90% of the server's advertised max).

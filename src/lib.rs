@@ -8,6 +8,13 @@ use core::mem::MaybeUninit;
 pub const FIFO: usize = 32;
 pub const MAG_BATCH: usize = 8;
 
+/// Values of the `qwp_last_error` health column.
+pub const QWP_ERR_CONNECT: u32 = 1;
+pub const QWP_ERR_READ: u32 = 2;
+pub const QWP_ERR_WRITE: u32 = 3;
+pub const QWP_ERR_SERVER: u32 = 4;
+pub const QWP_ERR_PROTOCOL: u32 = 5;
+
 /// One ring slot. Fixed size so the ring is a plain array in PSRAM.
 #[derive(Clone, Copy)]
 pub enum Rec {
@@ -50,6 +57,10 @@ pub enum Rec {
         drv_tx_busy: u32,
         /// QWP messages acked by QuestDB, cumulative since boot
         qwp_acks: u32,
+        /// QWP messages QuestDB rejected as bad data, which are dropped; cumulative since boot
+        qwp_rejected: u32,
+        /// why the last QWP connection ended: see `QWP_ERR_*`, 0 if none has
+        qwp_last_error: u32,
         uptime_s: u32,
         /// esp-hal's SocResetReason for the last boot
         reset_reason: u32,
@@ -189,6 +200,8 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
                 drv_tx_bytes,
                 drv_tx_busy,
                 qwp_acks,
+                qwp_rejected,
+                qwp_last_error,
                 uptime_s,
                 reset_reason,
             } => Some((
@@ -211,6 +224,8 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
                     drv_tx_bytes as i64,
                     drv_tx_busy as i64,
                     qwp_acks as i64,
+                    qwp_rejected as i64,
+                    qwp_last_error as i64,
                     uptime_s as i64,
                     reset_reason as i64,
                 ],
@@ -238,6 +253,8 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
             ("drv_tx_bytes", LONG),
             ("drv_tx_busy", LONG),
             ("qwp_acks", LONG),
+            ("qwp_rejected", LONG),
+            ("qwp_last_error", LONG),
             ("uptime_s", LONG),
             ("reset_reason", LONG),
         ];
@@ -250,6 +267,17 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
     }
 
     Ok(e.finish())
+}
+
+/// Why a QWP connection ended, from the sender's error message.
+pub fn qwp_err_code(e: &str) -> u32 {
+    match e {
+        "connect" => QWP_ERR_CONNECT,
+        "read" => QWP_ERR_READ,
+        "write" => QWP_ERR_WRITE,
+        "server error" | "server closed" => QWP_ERR_SERVER,
+        _ => QWP_ERR_PROTOCOL,
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +332,8 @@ mod tests {
             drv_tx_bytes: 0,
             drv_tx_busy: 0,
             qwp_acks: 0,
+            qwp_rejected: 7_654_321,
+            qwp_last_error: 6_543_217,
             uptime_s: 0,
             reset_reason: 0,
         };
@@ -312,5 +342,7 @@ mod tests {
         let has = |v: i64| buf[..n].windows(8).any(|w| w == v.to_le_bytes());
         assert!(has(-57));
         assert!(has(0xfedc_ba98_7654));
+        assert!(has(7_654_321));
+        assert!(has(6_543_217));
     }
 }
