@@ -10,9 +10,8 @@
 //! -> PSRAM ring buffer -> QWP over WebSocket to QuestDB. Timestamps are taken on the device.
 
 use core::cell::{Cell, RefCell};
-use core::fmt::Write as _;
 use core::mem::MaybeUninit;
-use core::net::{IpAddr, SocketAddr, SocketAddrV4};
+use core::net::{IpAddr, SocketAddr};
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering::Relaxed};
 
 use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
@@ -20,15 +19,12 @@ use embassy_executor::Spawner;
 use embassy_net::{
     Runner, Stack, StackResources,
     dns::DnsQueryType,
-    tcp::TcpSocket,
     udp::{PacketMetadata, UdpSocket},
 };
 use embassy_sync::blocking_mutex::{Mutex as BlockingMutex, raw::CriticalSectionRawMutex};
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex, signal::Signal};
 use embassy_time::{Delay, Duration, Instant, Timer, with_timeout};
 use embedded_hal_async::i2c::I2c as _;
-use embedded_io_async::Read as _;
-use embedded_io_async::Write as _;
 use esp_backtrace as _;
 use esp_hal::{
     Blocking,
@@ -49,8 +45,9 @@ use log::{error, info, warn};
 use lsm303agr::{
     AccelMode, AccelOutputDataRate, AccelScale, FifoMode, Lsm303agr, MagMode, MagOutputDataRate,
 };
-use s3_sensors::qwp;
-use s3_sensors::{FIFO, MAG_BATCH, Rec, Ring};
+use qwp_embedded::Ring;
+use qwp_embedded::sender::{self, Buffers, Stats};
+use s3_sensors::{DEVICE, FIFO, MAG_BATCH, Rec};
 use sntpc::{NtpContext, NtpTimestampGenerator, get_time};
 use sntpc_net_embassy::UdpSocketWrapper;
 
@@ -101,28 +98,20 @@ impl embedded_hal_async::i2c::I2c for SyncI2c {
     }
 }
 /// Shared across cores; every access is a short copy so the critical section stays tiny.
-type Shared = &'static BlockingMutex<CriticalSectionRawMutex, RefCell<Ring>>;
+type Shared = &'static sender::SharedRing<Rec>;
 
 /// Unix µs minus `Instant` µs. Instant runs off the 40 MHz crystal; the RTC's RC oscillator drifts too much.
 static OFFSET_US: critical_section::Mutex<Cell<i64>> = critical_section::Mutex::new(Cell::new(0));
 static SYNCED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 static FIFO_OVERRUNS: AtomicU32 = AtomicU32::new(0);
 // bytes on the wire and µs spent encoding; swapped into the 1 Hz health row
-static TX_BYTES: AtomicU32 = AtomicU32::new(0);
-static ENCODE_US: AtomicU32 = AtomicU32::new(0);
 // WiFi state for the 1 Hz health row; 0 when not associated (heap_free keeps its last value)
+static QWP_STATS: Stats = Stats::new();
 static RSSI_DBM: AtomicI32 = AtomicI32::new(0);
 static AP_BSSID: critical_section::Mutex<Cell<u64>> = critical_section::Mutex::new(Cell::new(0)); // no 64-bit atomics on Xtensa
 static WIFI_CHANNEL: AtomicU32 = AtomicU32::new(0);
 static HEAP_FREE: AtomicU32 = AtomicU32::new(0);
 static WIFI_DISCONNECTS: AtomicU32 = AtomicU32::new(0);
-static QWP_RECONNECTS: AtomicU32 = AtomicU32::new(0);
-static QWP_ACKS: AtomicU32 = AtomicU32::new(0);
-static QWP_REJECTED: AtomicU32 = AtomicU32::new(0);
-static QWP_LAST_ERROR: AtomicU32 = AtomicU32::new(0);
-/// (got, want) behind QWP_LAST_ERROR, for the errors that have them
-static QWP_ERR_DETAIL: critical_section::Mutex<Cell<(i64, i64)>> =
-    critical_section::Mutex::new(Cell::new((0, 0)));
 /// Newest health row that didn't fit in a full ring. The sender sends it ahead of the backlog, so
 /// a stall still reports itself instead of going silent.
 static LATEST_HEALTH: critical_section::Mutex<Cell<Option<Rec>>> =
@@ -228,7 +217,7 @@ async fn main(spawner: Spawner) -> ! {
     assert!(pre.is_empty());
     let (scratch, slots) = slots.split_at_mut(SCRATCH_RECS);
     let ring: Shared = mk_static!(
-        BlockingMutex<CriticalSectionRawMutex, RefCell<Ring>>,
+        sender::SharedRing<Rec>,
         BlockingMutex::new(RefCell::new(Ring::new(slots)))
     );
     let cap = ring.lock(|r| r.borrow().capacity());
@@ -293,7 +282,13 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(connection(controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
     spawner.spawn(sntp_task(stack).unwrap());
-    spawner.spawn(sender(stack, ring, body, tcp_tx, scratch).unwrap());
+    let buffers = Buffers {
+        body,
+        tcp_tx,
+        tcp_rx: mk_static!([u8; 2048], [0u8; 2048]),
+        scratch,
+    };
+    spawner.spawn(sender(stack, ring, buffers).unwrap());
 
     loop {
         Timer::after_secs(10).await;
@@ -606,24 +601,22 @@ async fn accel_task(bus: &'static Bus, ring: Shared) {
                     die_temp_c,
                     fifo_overruns: FIFO_OVERRUNS.load(Relaxed),
                     dropped,
-                    tx_bytes: TX_BYTES.swap(0, Relaxed),
-                    encode_us: ENCODE_US.swap(0, Relaxed),
+                    tx_bytes: QWP_STATS.tx_bytes.swap(0, Relaxed),
+                    encode_us: QWP_STATS.encode_us.swap(0, Relaxed),
                     rssi_dbm: RSSI_DBM.load(Relaxed),
                     ap_bssid: critical_section::with(|cs| AP_BSSID.borrow(cs).get()),
                     wifi_channel: WIFI_CHANNEL.load(Relaxed) as u8,
                     heap_free: HEAP_FREE.load(Relaxed),
                     wifi_disconnects: WIFI_DISCONNECTS.load(Relaxed),
-                    qwp_reconnects: QWP_RECONNECTS.load(Relaxed),
+                    qwp_reconnects: QWP_STATS.reconnects.load(Relaxed),
                     ring_len,
                     drv_rx_frames: DRV_RX_FRAMES.load(Relaxed),
                     drv_tx_frames: DRV_TX_FRAMES.load(Relaxed),
                     drv_tx_bytes: DRV_TX_BYTES.load(Relaxed),
                     drv_tx_busy: DRV_TX_BUSY.load(Relaxed),
-                    qwp_acks: QWP_ACKS.load(Relaxed),
-                    qwp_rejected: QWP_REJECTED.load(Relaxed),
-                    qwp_last_error: QWP_LAST_ERROR.load(Relaxed),
-                    qwp_err_got: critical_section::with(|cs| QWP_ERR_DETAIL.borrow(cs).get().0),
-                    qwp_err_want: critical_section::with(|cs| QWP_ERR_DETAIL.borrow(cs).get().1),
+                    qwp_acks: QWP_STATS.acks.load(Relaxed),
+                    qwp_rejected: QWP_STATS.rejected.load(Relaxed),
+                    qwp_last_error: QWP_STATS.last_error.load(Relaxed),
                     uptime_s: Instant::now().as_secs() as u32,
                     reset_reason: RESET_REASON.load(Relaxed),
                 };
@@ -637,277 +630,24 @@ async fn accel_task(bus: &'static Bus, ring: Shared) {
     }
 }
 
-struct SliceWriter<'a> {
-    buf: &'a mut [u8],
-    len: usize,
-}
-
-impl core::fmt::Write for SliceWriter<'_> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let end = self.len + s.len();
-        self.buf
-            .get_mut(self.len..end)
-            .ok_or(core::fmt::Error)?
-            .copy_from_slice(s.as_bytes());
-        self.len = end;
-        Ok(())
-    }
-}
-
-/// Reads an HTTP/1.1 response head into `buf`: `(status code, head length, bytes read)`.
-async fn read_head(
-    sock: &mut TcpSocket<'_>,
-    buf: &mut [u8],
-) -> Result<(u16, usize, usize), embassy_net::tcp::Error> {
-    let mut n = 0;
-    loop {
-        if n == buf.len() {
-            return Err(embassy_net::tcp::Error::ConnectionReset);
-        }
-        let r = sock.read(&mut buf[n..]).await?;
-        if r == 0 {
-            return Err(embassy_net::tcp::Error::ConnectionReset);
-        }
-        n += r;
-        if let Some(i) = buf[..n].windows(4).position(|w| w == b"\r\n\r\n") {
-            let code = core::str::from_utf8(&buf[9..12])
-                .ok()
-                .and_then(|c| c.parse().ok())
-                .unwrap_or(0);
-            return Ok((code, i + 4, n));
-        }
-    }
-}
-
-fn header<'a>(head: &'a [u8], name: &str) -> Option<&'a str> {
-    core::str::from_utf8(head).ok()?.lines().find_map(|l| {
-        let (k, v) = l.split_once(':')?;
-        k.eq_ignore_ascii_case(name).then(|| v.trim())
-    })
-}
-
-/// QWP over WebSocket: upgrade, then stream binary messages (up to MAX_INFLIGHT unacked). Records
-/// are popped from the ring only when QuestDB acks the message that carried them; on reconnect
-/// everything unacked is re-sent.
 #[embassy_executor::task]
-async fn sender(
-    stack: Stack<'static>,
-    ring: Shared,
-    body: &'static mut [u8],
-    tcp_tx: &'static mut [u8],
-    scratch: &'static mut [MaybeUninit<Rec>],
-) {
-    const MAX_INFLIGHT: usize = 8;
-    let questdb: SocketAddrV4 = QUESTDB.parse().expect("QUESTDB_ADDR must be ipv4:port");
+async fn sender(stack: Stack<'static>, ring: Shared, buffers: Buffers<Rec>) {
     let rng = Rng::new();
-    let mut tcp_rx = [0u8; 2048];
-    let mut resp = [0u8; 512];
-    stack.wait_config_up().await;
-    loop {
-        let mut sock = TcpSocket::new(stack, &mut tcp_rx, &mut *tcp_tx);
-        sock.set_timeout(Some(Duration::from_secs(10)));
-        let result: Result<(), &str> = async {
-            sock.connect((*questdb.ip(), questdb.port()))
-                .await
-                .map_err(|_| "connect")?;
-            let max_payload = qwp_upgrade(&mut sock, &mut resp, &rng)
-                .await?
-                .min(body.len() - 14);
-            info!("qwp connected, max payload {max_payload} B");
-
-            // record counts of unacked messages, oldest first; `sent` = their sum
-            let (mut inflight, mut nin, mut sent, mut next_seq) =
-                ([0usize; MAX_INFLIGHT], 0, 0, 0i64);
-            let mut last_send = Instant::now();
-            loop {
-                if nin < MAX_INFLIGHT
-                    && let Some(h) = critical_section::with(|cs| LATEST_HEALTH.borrow(cs).take())
-                {
-                    let len = s3_sensors::qwp_message(&mut body[14..14 + max_payload], &[h])
-                        .map_err(|_| "record exceeds max payload")?;
-                    let start = ws_frame(body, len, &rng);
-                    sock.write_all(&body[start..14 + len])
-                        .await
-                        .map_err(|_| "write")?;
-                    TX_BYTES.fetch_add((14 + len - start) as u32, Relaxed);
-                    inflight[nin] = 0; // not from the ring, so an ack pops nothing
-                    nin += 1;
-                    continue;
-                }
-                let unsent = ring.lock(|r| r.borrow().len()) - sent;
-                // batch like the reference client: ~100 ms or a full scratch of records
-                let due = unsent >= SCRATCH_RECS / 4
-                    || (unsent > 0 && last_send.elapsed() >= Duration::from_millis(100));
-                if nin > 0 && (nin == MAX_INFLIGHT || !due || sock.can_recv()) {
-                    let mut h = [0u8; 10];
-                    sock.read_exact(&mut h[..2]).await.map_err(|_| "read")?;
-                    let ext = match h[1] & 0x7F {
-                        126 => 2,
-                        127 => 8,
-                        _ => 0,
-                    };
-                    sock.read_exact(&mut h[2..2 + ext])
-                        .await
-                        .map_err(|_| "read")?;
-                    let (op, _, len) = qwp::ws_parse_header(&h).ok_or("frame header")?;
-                    let take = len.min(resp.len());
-                    sock.read_exact(&mut resp[..take])
-                        .await
-                        .map_err(|_| "read")?;
-                    for _ in take..len {
-                        sock.read_exact(&mut [0u8]).await.map_err(|_| "read")?; // never for QWP responses
-                    }
-                    match op {
-                        qwp::WS_BINARY => match qwp::parse_response(&resp[..take]) {
-                            Some((qwp::STATUS_DURABLE_ACK, ..)) => {}
-                            Some((status, Some(seq), msg)) => {
-                                if seq != next_seq {
-                                    error!("qwp ack seq {seq}, expected {next_seq}");
-                                    err_detail(seq, next_seq);
-                                    return Err("seq");
-                                }
-                                if status != qwp::STATUS_OK {
-                                    let msg = core::str::from_utf8(msg).unwrap_or("");
-                                    error!("qwp status {status} on seq {seq}: {msg}");
-                                    // bad data never succeeds: drop it rather than wedge the ring
-                                    if status != qwp::STATUS_PARSE_ERROR
-                                        && status != qwp::STATUS_SCHEMA_MISMATCH
-                                    {
-                                        return Err("server error");
-                                    }
-                                    QWP_REJECTED.fetch_add(1, Relaxed);
-                                }
-                                next_seq += 1;
-                                QWP_ACKS.fetch_add(1, Relaxed);
-                                ring.lock(|r| r.borrow_mut().pop(inflight[0]));
-                                sent -= inflight[0];
-                                inflight.copy_within(1..nin, 0);
-                                nin -= 1;
-                            }
-                            _ => {
-                                err_detail(
-                                    resp[..take].first().map_or(-1, |&b| b as i64),
-                                    len as i64,
-                                );
-                                return Err("bad response");
-                            }
-                        },
-                        qwp::WS_PING => {
-                            let mask = rng.random().to_le_bytes();
-                            let mut f = [0u8; 14];
-                            let hl = qwp::ws_header(&mut f, qwp::WS_PONG, take, mask);
-                            qwp::ws_mask(&mut resp[..take], mask);
-                            sock.write_all(&f[..hl]).await.map_err(|_| "write")?;
-                            sock.write_all(&resp[..take]).await.map_err(|_| "write")?;
-                        }
-                        qwp::WS_CLOSE => return Err("server closed"),
-                        _ => {}
-                    }
-                    continue;
-                }
-                if !due {
-                    Timer::after_millis(10).await;
-                    continue;
-                }
-
-                let mut k = unsent.min(scratch.len());
-                for (i, slot) in scratch[..k].iter_mut().enumerate() {
-                    let r = ring.lock(|r| r.borrow().get(sent + i)).ok_or("ring")?;
-                    slot.write(r);
-                }
-                // SAFETY: the first k slots were just written
-                let recs =
-                    unsafe { core::slice::from_raw_parts(scratch.as_ptr().cast::<Rec>(), k) };
-                let t0 = Instant::now();
-                let len = loop {
-                    match s3_sensors::qwp_message(&mut body[14..14 + max_payload], &recs[..k]) {
-                        Ok(n) => break n,
-                        Err(_) if k > 1 => k /= 2,
-                        Err(_) => return Err("record exceeds max payload"),
-                    }
-                };
-                let start = ws_frame(body, len, &rng);
-                ENCODE_US.fetch_add(t0.elapsed().as_micros() as u32, Relaxed);
-                sock.write_all(&body[start..14 + len])
-                    .await
-                    .map_err(|_| "write")?;
-                TX_BYTES.fetch_add((14 + len - start) as u32, Relaxed);
-                inflight[nin] = k;
-                nin += 1;
-                sent += k;
-                last_send = Instant::now();
-            }
-        }
-        .await;
-        if let Err(e) = result {
-            QWP_RECONNECTS.fetch_add(1, Relaxed);
-            let code = s3_sensors::qwp_err_code(e);
-            if code != s3_sensors::QWP_ERR_SEQ && code != s3_sensors::QWP_ERR_BAD_RESPONSE {
-                err_detail(0, 0);
-            }
-            QWP_LAST_ERROR.store(code, Relaxed);
-            warn!("qwp: {e}, reconnecting");
-        }
-        sock.abort();
-        let _ = sock.flush().await;
-        Timer::after_secs(1).await;
-    }
-}
-
-/// Masks the payload at `body[14..14 + len]` and writes a binary frame header just before it;
-/// returns where the frame starts.
-fn ws_frame(body: &mut [u8], len: usize, rng: &Rng) -> usize {
-    let mask = rng.random().to_le_bytes();
-    qwp::ws_mask(&mut body[14..14 + len], mask);
-    let mut f = [0u8; 14];
-    let hl = qwp::ws_header(&mut f, qwp::WS_BINARY, len, mask);
-    body[14 - hl..14].copy_from_slice(&f[..hl]);
-    14 - hl
-}
-
-/// WebSocket upgrade to QWP; returns the payload budget (90% of the server's advertised max).
-async fn qwp_upgrade(
-    sock: &mut TcpSocket<'_>,
-    buf: &mut [u8],
-    rng: &Rng,
-) -> Result<usize, &'static str> {
-    let mut nonce = [0u8; 16];
-    nonce
-        .chunks_mut(4)
-        .for_each(|c| c.copy_from_slice(&rng.random().to_le_bytes()));
-    let key = qwp::ws_key(nonce);
-    let mut req = [0u8; 256];
-    let mut w = SliceWriter {
-        buf: &mut req,
-        len: 0,
+    let config = sender::Config {
+        addr: QUESTDB.parse().expect("QUESTDB_ADDR must be ipv4:port"),
+        client_id: concat!("s3-sensors/", env!("CARGO_PKG_VERSION")),
+        symbols: &[DEVICE],
+        batch_interval: Duration::from_millis(100), // like the reference client
+        stats: &QWP_STATS,
     };
-    write!(
-        w,
-        "GET /write/v4 HTTP/1.1\r\nHost: questdb\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-         Sec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\nX-QWP-Max-Version: 1\r\n\
-         X-QWP-Client-Id: s3-sensors/{}\r\n\r\n",
-        core::str::from_utf8(&key).unwrap(),
-        env!("CARGO_PKG_VERSION")
+    sender::run(
+        stack,
+        ring,
+        buffers,
+        &config,
+        || rng.random(),
+        || critical_section::with(|cs| LATEST_HEALTH.borrow(cs).take()),
+        s3_sensors::encode,
     )
-    .map_err(|_| "request too long")?;
-    let n = w.len;
-    sock.write_all(&req[..n]).await.map_err(|_| "write")?;
-    // ponytail: Sec-WebSocket-Accept isn't verified (needs SHA-1); the server is a known QuestDB
-    let (code, head_end, _) = read_head(sock, buf).await.map_err(|_| "read")?;
-    let head = &buf[..head_end];
-    if code != 101 {
-        warn!("qwp upgrade: HTTP {code}");
-        return Err("upgrade refused");
-    }
-    if header(head, "x-qwp-version") != Some("1") {
-        return Err("unsupported QWP version");
-    }
-    let max = header(head, "x-qwp-max-batch-size")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1_900_000);
-    Ok(max / 10 * 9)
-}
-
-fn err_detail(got: i64, want: i64) {
-    critical_section::with(|cs| QWP_ERR_DETAIL.borrow(cs).set((got, want)));
+    .await
 }

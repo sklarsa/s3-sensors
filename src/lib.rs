@@ -1,27 +1,10 @@
 #![cfg_attr(not(test), no_std)]
 
-pub mod qwp;
-
-use core::mem::MaybeUninit;
+use qwp_embedded as qwp;
 
 /// Accel FIFO depth on the LSM303AGR.
 pub const FIFO: usize = 32;
 pub const MAG_BATCH: usize = 8;
-
-/// Values of the `qwp_last_error` health column.
-pub const QWP_ERR_CONNECT: u32 = 1;
-pub const QWP_ERR_READ: u32 = 2;
-pub const QWP_ERR_WRITE: u32 = 3;
-pub const QWP_ERR_SERVER: u32 = 4;
-/// any other error; the codes below split out the ones we know
-pub const QWP_ERR_PROTOCOL: u32 = 5;
-/// an ack's sequence wasn't the next one expected: `qwp_err_got`, `qwp_err_want`
-pub const QWP_ERR_SEQ: u32 = 6;
-/// a binary frame that isn't a QWP response: first byte, frame length
-pub const QWP_ERR_BAD_RESPONSE: u32 = 7;
-pub const QWP_ERR_FRAME_HEADER: u32 = 8;
-pub const QWP_ERR_UPGRADE: u32 = 9;
-pub const QWP_ERR_TOO_BIG: u32 = 10;
 
 /// One ring slot. Fixed size so the ring is a plain array in PSRAM.
 #[derive(Clone, Copy)]
@@ -69,60 +52,10 @@ pub enum Rec {
         qwp_rejected: u32,
         /// why the last QWP connection ended: see `QWP_ERR_*`, 0 if none has
         qwp_last_error: u32,
-        /// values behind `qwp_last_error`, see `QWP_ERR_*`
-        qwp_err_got: i64,
-        qwp_err_want: i64,
         uptime_s: u32,
         /// esp-hal's SocResetReason for the last boot
         reset_reason: u32,
     },
-}
-
-/// Drop-newest ring: the sender may be reading the head while the sensor task pushes.
-pub struct Ring {
-    buf: &'static mut [MaybeUninit<Rec>],
-    head: usize,
-    len: usize,
-    pub dropped: u32,
-}
-
-impl Ring {
-    pub fn new(buf: &'static mut [MaybeUninit<Rec>]) -> Self {
-        Self {
-            buf,
-            head: 0,
-            len: 0,
-            dropped: 0,
-        }
-    }
-    pub fn push(&mut self, r: Rec) {
-        if self.len == self.buf.len() {
-            self.dropped += 1; // ponytail: drops newest when full, keeps in-flight head stable
-            return;
-        }
-        let i = (self.head + self.len) % self.buf.len();
-        self.buf[i].write(r);
-        self.len += 1;
-    }
-    pub fn len(&self) -> usize {
-        self.len
-    }
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-    pub fn capacity(&self) -> usize {
-        self.buf.len()
-    }
-    pub fn get(&self, i: usize) -> Option<Rec> {
-        // SAFETY: slots [head, head+len) were written by push
-        (i < self.len)
-            .then(|| unsafe { self.buf[(self.head + i) % self.buf.len()].assume_init_read() })
-    }
-    pub fn pop(&mut self, n: usize) {
-        let n = n.min(self.len);
-        self.head = (self.head + n) % self.buf.len();
-        self.len -= n;
-    }
 }
 
 /// Low-power mode is 8-bit, left-justified: at ±4 g one digit of the high byte is 31.26 mg (datasheet table 3).
@@ -141,10 +74,12 @@ fn sample_us(t_us: i64, dt_ns: u32, n: u8, i: usize) -> i64 {
     t_us - (n as i64 - 1 - i as i64) * dt_ns as i64 / 1000
 }
 
-/// Encodes records as one QWP message with up to three table blocks: accel, mag, health.
-pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
-    use qwp::{FLOAT, LONG};
-    let mut e = qwp::Encoder::new(out)?;
+/// This device's name in the shared `health` table; the only entry in the symbol dictionary.
+pub const DEVICE: &str = "s3-sensors";
+
+/// Encodes records as up to three table blocks: accel, mag, health.
+pub fn encode(e: &mut qwp::Encoder<'_>, recs: &[Rec]) -> Result<(), qwp::Full> {
+    use qwp::{FLOAT, LONG, SYMBOL};
 
     let accel = || {
         recs.iter()
@@ -213,8 +148,6 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
                 qwp_acks,
                 qwp_rejected,
                 qwp_last_error,
-                qwp_err_got,
-                qwp_err_want,
                 uptime_s,
                 reset_reason,
             } => Some((
@@ -239,8 +172,6 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
                     qwp_acks as i64,
                     qwp_rejected as i64,
                     qwp_last_error as i64,
-                    qwp_err_got,
-                    qwp_err_want,
                     uptime_s as i64,
                     reset_reason as i64,
                 ],
@@ -251,6 +182,7 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
     let rows = health().count();
     if rows > 0 {
         let cols = [
+            ("device", SYMBOL),
             ("die_temp_c", FLOAT),
             ("fifo_overruns", LONG),
             ("dropped", LONG),
@@ -270,41 +202,30 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
             ("qwp_acks", LONG),
             ("qwp_rejected", LONG),
             ("qwp_last_error", LONG),
-            ("qwp_err_got", LONG),
-            ("qwp_err_want", LONG),
             ("uptime_s", LONG),
             ("reset_reason", LONG),
         ];
         e.table("health", rows, &cols)?;
+        e.symbols(health().map(|_| 0))?;
         e.f32s(health().map(|h| h.1))?;
-        for c in 0..cols.len() - 1 {
+        for c in 0..cols.len() - 2 {
             e.i64s(health().map(|h| h.2[c]))?;
         }
         e.timestamps(health().map(|h| h.0))?;
     }
 
-    Ok(e.finish())
-}
-
-/// Why a QWP connection ended, from the sender's error message.
-pub fn qwp_err_code(e: &str) -> u32 {
-    match e {
-        "connect" => QWP_ERR_CONNECT,
-        "read" => QWP_ERR_READ,
-        "write" => QWP_ERR_WRITE,
-        "server error" | "server closed" => QWP_ERR_SERVER,
-        "seq" => QWP_ERR_SEQ,
-        "bad response" => QWP_ERR_BAD_RESPONSE,
-        "frame header" => QWP_ERR_FRAME_HEADER,
-        "upgrade refused" => QWP_ERR_UPGRADE,
-        "record exceeds max payload" => QWP_ERR_TOO_BIG,
-        _ => QWP_ERR_PROTOCOL,
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
+        let mut e = qwp::Encoder::new(out)?;
+        encode(&mut e, recs)?;
+        Ok(e.finish())
+    }
 
     fn accel_rec(t_us: i64) -> Rec {
         Rec::Accel {
@@ -356,8 +277,6 @@ mod tests {
             qwp_acks: 0,
             qwp_rejected: 7_654_321,
             qwp_last_error: 6_543_217,
-            qwp_err_got: -5_432_171,
-            qwp_err_want: 4_321_715,
             uptime_s: 0,
             reset_reason: 0,
         };
@@ -368,25 +287,5 @@ mod tests {
         assert!(has(0xfedc_ba98_7654));
         assert!(has(7_654_321));
         assert!(has(6_543_217));
-        assert!(has(-5_432_171));
-        assert!(has(4_321_715));
-    }
-
-    #[test]
-    fn err_codes_distinct() {
-        let names = [
-            "connect",
-            "read",
-            "write",
-            "server error",
-            "seq",
-            "bad response",
-            "frame header",
-            "upgrade refused",
-            "record exceeds max payload",
-            "ring",
-        ];
-        let codes: std::vec::Vec<u32> = names.iter().map(|n| qwp_err_code(n)).collect();
-        assert_eq!(codes, [1, 2, 3, 4, 6, 7, 8, 9, 10, 5]);
     }
 }

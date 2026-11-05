@@ -3,7 +3,7 @@
 `no_std` Rust firmware (esp-hal + embassy) that streams an LSM303AGR accelerometer at its
 maximum rate into [QuestDB](https://questdb.io) over
 [QWP](https://questdb.com/docs/connect/wire-protocols/qwp-ingress-websocket/), QuestDB's
-binary columnar wire protocol, with a minimal `no_std` QWP encoder in [`src/qwp.rs`](src/qwp.rs).
+binary columnar wire protocol, using [qwp-embedded](https://github.com/sklarsa/qwp-embedded).
 
 ## QWP vs ILP, measured on the device
 
@@ -52,10 +52,11 @@ Configuration is compiled in from the environment:
 WIFI_SSID=... WIFI_PASSWORD=... QUESTDB_ADDR=192.168.1.10:9000 cargo run --release
 ```
 
-The QWP encoder and record encoding are core-only, so their tests run on the host:
+Record encoding is core-only, so its tests run on the host, against a checkout of qwp-embedded:
 
 ```sh
-rustc +stable --edition 2024 --test src/lib.rs -o /tmp/s3-tests && /tmp/s3-tests --nocapture
+rustc +stable --edition 2024 --crate-type rlib --crate-name qwp_embedded ../qwp-embedded/src/lib.rs -o /tmp/libqwp_embedded.rlib
+rustc +stable --edition 2024 --test src/lib.rs --extern qwp_embedded=/tmp/libqwp_embedded.rlib -o /tmp/s3-tests && /tmp/s3-tests --nocapture
 ```
 
 ## QuestDB tables
@@ -69,14 +70,14 @@ CREATE TABLE IF NOT EXISTS accel (ts TIMESTAMP, x FLOAT, y FLOAT, z FLOAT) -- m/
   TIMESTAMP(ts) PARTITION BY HOUR TTL 3 DAYS WAL;
 CREATE TABLE IF NOT EXISTS mag (ts TIMESTAMP, x FLOAT, y FLOAT, z FLOAT) -- µT
   TIMESTAMP(ts) PARTITION BY DAY TTL 30 DAYS WAL;
-CREATE TABLE IF NOT EXISTS health (ts TIMESTAMP, die_temp_c FLOAT, fifo_overruns LONG, dropped LONG,
+CREATE TABLE IF NOT EXISTS health (ts TIMESTAMP, device SYMBOL, die_temp_c FLOAT, fifo_overruns LONG, dropped LONG,
   tx_bytes LONG, encode_us LONG, -- per-second bytes sent and µs spent encoding
   rssi_dbm LONG, ap_bssid LONG, wifi_channel LONG, -- 0 when not associated; bssid is the MAC as an integer
   heap_free LONG, wifi_disconnects LONG, qwp_reconnects LONG, -- counts are cumulative since boot
   ring_len LONG, -- records waiting for an ack
   drv_rx_frames LONG, drv_tx_frames LONG, drv_tx_bytes LONG, drv_tx_busy LONG, -- TCP stack <-> WiFi driver, cumulative
   qwp_acks LONG, uptime_s LONG, reset_reason LONG)
-  TIMESTAMP(ts) PARTITION BY MONTH WAL;
+  TIMESTAMP(ts) PARTITION BY MONTH WAL DEDUP UPSERT KEYS(ts, device);
 ```
 
 ## Known limits

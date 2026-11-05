@@ -1661,6 +1661,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "qwp-embedded"
+version = "0.1.0"
+source = "git+https://github.com/sklarsa/qwp-embedded?rev=a76395adc635818be8a1b066e7211f287ec4e83b#a76395adc635818be8a1b066e7211f287ec4e83b"
+dependencies = [
+ "embassy-net",
+ "embassy-sync 0.8.0",
+ "embassy-time",
+ "embedded-io-async 0.7.0",
+ "log",
+]
+
+[[package]]
 name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1802,6 +1814,7 @@ dependencies = [
  "esp-rtos",
  "log",
  "lsm303agr",
+ "qwp-embedded",
  "smoltcp 0.14.0",
  "sntpc",
  "sntpc-net-embassy",
