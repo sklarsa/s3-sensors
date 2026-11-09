@@ -13,7 +13,15 @@ pub const QWP_ERR_CONNECT: u32 = 1;
 pub const QWP_ERR_READ: u32 = 2;
 pub const QWP_ERR_WRITE: u32 = 3;
 pub const QWP_ERR_SERVER: u32 = 4;
+/// any other error; the codes below split out the ones we know
 pub const QWP_ERR_PROTOCOL: u32 = 5;
+/// an ack's sequence wasn't the next one expected: `qwp_err_got`, `qwp_err_want`
+pub const QWP_ERR_SEQ: u32 = 6;
+/// a binary frame that isn't a QWP response: first byte, frame length
+pub const QWP_ERR_BAD_RESPONSE: u32 = 7;
+pub const QWP_ERR_FRAME_HEADER: u32 = 8;
+pub const QWP_ERR_UPGRADE: u32 = 9;
+pub const QWP_ERR_TOO_BIG: u32 = 10;
 
 /// One ring slot. Fixed size so the ring is a plain array in PSRAM.
 #[derive(Clone, Copy)]
@@ -61,6 +69,9 @@ pub enum Rec {
         qwp_rejected: u32,
         /// why the last QWP connection ended: see `QWP_ERR_*`, 0 if none has
         qwp_last_error: u32,
+        /// values behind `qwp_last_error`, see `QWP_ERR_*`
+        qwp_err_got: i64,
+        qwp_err_want: i64,
         uptime_s: u32,
         /// esp-hal's SocResetReason for the last boot
         reset_reason: u32,
@@ -202,6 +213,8 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
                 qwp_acks,
                 qwp_rejected,
                 qwp_last_error,
+                qwp_err_got,
+                qwp_err_want,
                 uptime_s,
                 reset_reason,
             } => Some((
@@ -226,6 +239,8 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
                     qwp_acks as i64,
                     qwp_rejected as i64,
                     qwp_last_error as i64,
+                    qwp_err_got,
+                    qwp_err_want,
                     uptime_s as i64,
                     reset_reason as i64,
                 ],
@@ -255,6 +270,8 @@ pub fn qwp_message(out: &mut [u8], recs: &[Rec]) -> Result<usize, qwp::Full> {
             ("qwp_acks", LONG),
             ("qwp_rejected", LONG),
             ("qwp_last_error", LONG),
+            ("qwp_err_got", LONG),
+            ("qwp_err_want", LONG),
             ("uptime_s", LONG),
             ("reset_reason", LONG),
         ];
@@ -276,6 +293,11 @@ pub fn qwp_err_code(e: &str) -> u32 {
         "read" => QWP_ERR_READ,
         "write" => QWP_ERR_WRITE,
         "server error" | "server closed" => QWP_ERR_SERVER,
+        "seq" => QWP_ERR_SEQ,
+        "bad response" => QWP_ERR_BAD_RESPONSE,
+        "frame header" => QWP_ERR_FRAME_HEADER,
+        "upgrade refused" => QWP_ERR_UPGRADE,
+        "record exceeds max payload" => QWP_ERR_TOO_BIG,
         _ => QWP_ERR_PROTOCOL,
     }
 }
@@ -334,6 +356,8 @@ mod tests {
             qwp_acks: 0,
             qwp_rejected: 7_654_321,
             qwp_last_error: 6_543_217,
+            qwp_err_got: -5_432_171,
+            qwp_err_want: 4_321_715,
             uptime_s: 0,
             reset_reason: 0,
         };
@@ -344,5 +368,25 @@ mod tests {
         assert!(has(0xfedc_ba98_7654));
         assert!(has(7_654_321));
         assert!(has(6_543_217));
+        assert!(has(-5_432_171));
+        assert!(has(4_321_715));
+    }
+
+    #[test]
+    fn err_codes_distinct() {
+        let names = [
+            "connect",
+            "read",
+            "write",
+            "server error",
+            "seq",
+            "bad response",
+            "frame header",
+            "upgrade refused",
+            "record exceeds max payload",
+            "ring",
+        ];
+        let codes: std::vec::Vec<u32> = names.iter().map(|n| qwp_err_code(n)).collect();
+        assert_eq!(codes, [1, 2, 3, 4, 6, 7, 8, 9, 10, 5]);
     }
 }

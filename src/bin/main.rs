@@ -120,6 +120,9 @@ static QWP_RECONNECTS: AtomicU32 = AtomicU32::new(0);
 static QWP_ACKS: AtomicU32 = AtomicU32::new(0);
 static QWP_REJECTED: AtomicU32 = AtomicU32::new(0);
 static QWP_LAST_ERROR: AtomicU32 = AtomicU32::new(0);
+/// (got, want) behind QWP_LAST_ERROR, for the errors that have them
+static QWP_ERR_DETAIL: critical_section::Mutex<Cell<(i64, i64)>> =
+    critical_section::Mutex::new(Cell::new((0, 0)));
 /// Newest health row that didn't fit in a full ring. The sender sends it ahead of the backlog, so
 /// a stall still reports itself instead of going silent.
 static LATEST_HEALTH: critical_section::Mutex<Cell<Option<Rec>>> =
@@ -318,8 +321,11 @@ async fn connection(mut controller: WifiController<'static>) {
                 info!("wifi connected");
                 let mut secs = 0u32;
                 let gone = loop {
-                    match with_timeout(Duration::from_secs(1), controller.wait_for_disconnect_async())
-                        .await
+                    match with_timeout(
+                        Duration::from_secs(1),
+                        controller.wait_for_disconnect_async(),
+                    )
+                    .await
                     {
                         Ok(r) => break r,
                         Err(_) => {}
@@ -616,6 +622,8 @@ async fn accel_task(bus: &'static Bus, ring: Shared) {
                     qwp_acks: QWP_ACKS.load(Relaxed),
                     qwp_rejected: QWP_REJECTED.load(Relaxed),
                     qwp_last_error: QWP_LAST_ERROR.load(Relaxed),
+                    qwp_err_got: critical_section::with(|cs| QWP_ERR_DETAIL.borrow(cs).get().0),
+                    qwp_err_want: critical_section::with(|cs| QWP_ERR_DETAIL.borrow(cs).get().1),
                     uptime_s: Instant::now().as_secs() as u32,
                     reset_reason: RESET_REASON.load(Relaxed),
                 };
@@ -755,6 +763,7 @@ async fn sender(
                             Some((status, Some(seq), msg)) => {
                                 if seq != next_seq {
                                     error!("qwp ack seq {seq}, expected {next_seq}");
+                                    err_detail(seq, next_seq);
                                     return Err("seq");
                                 }
                                 if status != qwp::STATUS_OK {
@@ -775,7 +784,13 @@ async fn sender(
                                 inflight.copy_within(1..nin, 0);
                                 nin -= 1;
                             }
-                            _ => return Err("bad response"),
+                            _ => {
+                                err_detail(
+                                    resp[..take].first().map_or(-1, |&b| b as i64),
+                                    len as i64,
+                                );
+                                return Err("bad response");
+                            }
                         },
                         qwp::WS_PING => {
                             let mask = rng.random().to_le_bytes();
@@ -826,7 +841,11 @@ async fn sender(
         .await;
         if let Err(e) = result {
             QWP_RECONNECTS.fetch_add(1, Relaxed);
-            QWP_LAST_ERROR.store(s3_sensors::qwp_err_code(e), Relaxed);
+            let code = s3_sensors::qwp_err_code(e);
+            if code != s3_sensors::QWP_ERR_SEQ && code != s3_sensors::QWP_ERR_BAD_RESPONSE {
+                err_detail(0, 0);
+            }
+            QWP_LAST_ERROR.store(code, Relaxed);
             warn!("qwp: {e}, reconnecting");
         }
         sock.abort();
@@ -887,4 +906,8 @@ async fn qwp_upgrade(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1_900_000);
     Ok(max / 10 * 9)
+}
+
+fn err_detail(got: i64, want: i64) {
+    critical_section::with(|cs| QWP_ERR_DETAIL.borrow(cs).set((got, want)));
 }
