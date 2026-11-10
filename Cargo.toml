@@ -68,7 +68,7 @@ embedded-hal-async = "1.0.0"
 sntpc = { version = "0.11", default-features = false }
 sntpc-net-embassy = { version = "0.11", default-features = false }
 embedded-hal = "1"
-qwp-embedded = { git = "https://github.com/sklarsa/qwp-embedded", rev = "06aed5b5c4cbf511adc0ddedc5913119708b2fbd", features = ["sender"] }
+qwp-embedded = { git = "https://github.com/sklarsa/qwp-embedded", rev = "fc0b56fcb99d5758962748232bf8d4a8426aa612", features = ["sender"] }
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
