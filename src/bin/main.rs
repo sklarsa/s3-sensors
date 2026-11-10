@@ -316,14 +316,13 @@ async fn connection(mut controller: WifiController<'static>) {
                 info!("wifi connected");
                 let mut secs = 0u32;
                 let gone = loop {
-                    match with_timeout(
+                    if let Ok(r) = with_timeout(
                         Duration::from_secs(1),
                         controller.wait_for_disconnect_async(),
                     )
                     .await
                     {
-                        Ok(r) => break r,
-                        Err(_) => {}
+                        break r;
                     }
                     RSSI_DBM.store(controller.rssi().unwrap_or(0), Relaxed);
                     HEAP_FREE.store(esp_alloc::HEAP.free() as u32, Relaxed);
@@ -332,7 +331,7 @@ async fn connection(mut controller: WifiController<'static>) {
                             let bssid = ap.bssid.iter().fold(0u64, |a, b| a << 8 | *b as u64);
                             critical_section::with(|cs| AP_BSSID.borrow(cs).set(bssid));
                             WIFI_CHANNEL.store(ap.channel as u32, Relaxed);
-                            if secs % 10 == 0 {
+                            if secs.is_multiple_of(10) {
                                 info!(
                                     "ap {:02x?} ch{} beacon_rssi={} heap_free={}",
                                     ap.bssid,
